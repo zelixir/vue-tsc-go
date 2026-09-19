@@ -1,0 +1,27 @@
+{
+	"name": "vue-tsc-go",
+	"version": "0.1.0",
+	"description": "vue-tsc replacement backed by the tsgo (TypeScript Go port) engine via typescript-native-bridge.",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/zelixir/vue-tsc-go.git"
+	},
+	"bin": {
+		"vue-tsc-go": "./bin/vue-tsc-go.js"
+	},
+	"main": "./bin/vue-tsc-go.js",
+	"files": [
+		"bin"
+	],
+	"engines": {
+		"node": ">=20.19"
+	},
+	"scripts": {
+		"test": "node test/selftest.js && node test/cache.test.js && node test/mutation.test.js"
+	},
+	"dependencies": {
+		"typescript-native-bridge": "6.0.3-bridge.16.tsgo.7.0.2",
+		"vue-tsc": "3.1.5"
+	}
+}
