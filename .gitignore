@@ -1,2 +1,5 @@
 node_modules/
 .vue-tsc-go-cache/
+# test-run artifacts
+test/fixture/.idle-cache/
+.vue-tsc-go-sub-*.json

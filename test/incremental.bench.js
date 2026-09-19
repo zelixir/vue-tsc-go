@@ -135,7 +135,7 @@ function runScenario(name) {
 		fs.writeFileSync(file, sc.mutate(backup));
 		const incr = runVueTscGo(project, project.args, { VUE_TSC_GO_DEBUG: "1" });
 		results.incrMs = incr.ms;
-		results.incrMode = /mode=(\w+)/.exec(incr.stderr)?.[1] || "?";
+		results.incrMode = /mode=([\w-]+)/.exec(incr.stderr)?.[1] || "?";
 		results.incrAffected = /affected=(\d+)/.exec(incr.stderr)?.[1] || "?";
 		const full = runVueTscGo(project, project.args, { VUE_TSC_GO_NO_CACHE: "1" });
 		results.fullMs = full.ms;
@@ -148,7 +148,7 @@ function runScenario(name) {
 		restore();
 		const back = runVueTscGo(project, project.args, { VUE_TSC_GO_DEBUG: "1" });
 		results.restoreMs = back.ms;
-		results.restoreMode = /mode=(\w+)/.exec(back.stderr)?.[1] || "?";
+		results.restoreMode = /mode=([\w-]+)/.exec(back.stderr)?.[1] || "?";
 		results.restoreEqBaseline = back.stdout === results.baseline && back.exitCode === cold.exitCode;
 
 		// 5. confirm a plain hit still replays exactly

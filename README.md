@@ -48,7 +48,7 @@ bin/vue-tsc-go.js
 ## 与原版 vue-tsc 的差异
 
 - 引擎:`typescript`(JS)→ `typescript-native-bridge`(tsgo,Go)。
-- 启动型 typecheck 提速约 3 倍(3 个真实项目基准:10s/6.5s/10.5s → 3.2s/1.8s/3.6s),峰值内存相当(约 1.1~1.2 倍,含 re-exec 的父子进程)。
+- 启动型 typecheck 提速约 3 倍(3 个真实项目基准:10s/6.5s/10.5s → 3.2s/1.8s/3.6s),峰值内存相当(约 1.1~1.2 倍;结果缓存命中时 0.1s/40MB 级)。
 - 依赖里多带一份 bridge 版 TypeScript(不冲突,js 内部重定向)。
 
 ## 已知限制 / 与基线的诊断差异
@@ -72,9 +72,9 @@ bin/vue-tsc-go.js
 
 ### 工作原理
 
-1. 启动时在不加载检查器的情况下,用 bridge TypeScript 解析 tsconfig(带 `.vue` 扩展感知的 readDirectory,根文件集与真实检查一致),对全部输入文件做 sha1 内容哈希,连同 tsconfig `extends` 链内容哈希、解析出的 compilerOptions、完整 CLI 参数、工具链版本(bridge 版本 + TNB 补丁层内容哈希、解析到的 vue-tsc 模块路径)一起算出缓存 key。
-2. **命中**:回放缓存的 stdout/stderr/退出码。命中前还会对上次检查运行 dump 出的**完整 program 文件清单**(含 node_modules、monorepo workspace 包等被间接拉入检查的文件)逐个做 size+mtime 校验,任何变化都判定失效——即使改动不在 tsconfig 根文件集内也能正确失效。
-3. **未命中**:在子进程完整跑一遍检查,捕获输出与 program 文件清单(经 `scripts/patch-tnb-directives.js` 的 TNB-DUMPPATCH 注入,标记 `VUE_TSC_GO_DUMP_FILES` 环境变量触发),原子写入(临时文件 + rename)缓存条目后回放。并行启动同一项目只写一份条目,不会互相破坏。
+1. 启动时在不加载检查器的情况下,用 bridge TypeScript 解析 tsconfig(带 `.vue` 扩展感知的 readDirectory,根文件集与真实检查一致),对全部输入文件算内容哈希,连同 tsconfig `extends` 链内容哈希、解析出的 compilerOptions、完整 CLI 参数、工具链版本(bridge 版本 + TNB 补丁层内容哈希、解析到的 vue-tsc 模块路径)一起算出缓存 key。内容哈希阶段带 **mtime+size 快筛**:与上次运行(`rootmeta.json` 边车)比对 stat,仅 stat 变化的文件重新读取哈希,最终 key 仍是纯内容哈希(stat 变了必重读,内容变化必然被发现)。指纹阶段实测 ~0.19s @ element-plus(其中 bridge bundle 的 require 即 ~0.11s,为加载 TypeScript 解析器的固有成本)。
+2. **命中**:回放缓存的 stdout/stderr/退出码。命中前还会对上次检查运行 dump 出的**完整 program 文件清单**(含 node_modules、monorepo workspace 包等被间接拉入检查的文件)逐个做 size+mtime 校验(stat 变化时以存储的内容哈希复核),任何内容变化都判定失效——即使改动不在 tsconfig 根文件集内也能正确失效。
+3. **未命中**:**在当前进程内**完整跑一遍检查(tsc 驱动的收尾 `process.exit()` 被拦截转换为退出码,stdout/stderr 经流写入拦截捕获,无子进程),捕获输出与 program 文件清单(经 `scripts/patch-tnb-directives.js` 的 TNB-DUMPPATCH 注入,标记 `VUE_TSC_GO_DUMP_FILES` 环境变量触发),原子写入(临时文件 + rename)缓存条目后回放。并行启动同一项目只写一份条目,不会互相破坏。
 4. 缓存位置:优先 `<tsconfig 同级>/node_modules/.cache/vue-tsc-go`,无 node_modules 时 `<tsconfig 同级>/.vue-tsc-go-cache`;条目超过 24 个时按最旧淘汰。
 
 ### 失效条件(保守策略)
@@ -88,15 +88,17 @@ bin/vue-tsc-go.js
 - program 文件清单走 size+mtime 校验而非内容哈希:同内容但 mtime 变化的文件(如 `git checkout`、重装依赖)会造成一次多余的失效重跑(方向安全);**新增**文件如果未被任何已跟踪文件引用,不会被察觉(但不被引用的文件不影响诊断)。
 - 诊断输出中的相对路径按运行时 cwd 解析,同一项目从不同 cwd 运行会得到不同 key(安全但缓存不共享)。
 
-### 会话级按需 worker（增量 typecheck 再提速）
+### 会话级按需 worker(实验特性,严格 opt-in)
 
-在"编辑几个文件 → 再跑一次 typecheck"的本地循环里,连缓存命中路径的冷启动地板（进程启动 + 全量指纹哈希 ≈ 0.3s）与增量路径的子进程冷启动（Node + bundle 加载 ≈ 0.9s）都可以省掉。为此 vue-tsc-go 提供**按需拉起、空闲自退的常驻会话 worker**（`bin/worker.js`）:
+> **注意**:worker 是**实验特性,默认完全关闭**。多个 git worktree 并行交叉 typecheck 的场景**不建议启用**——每个会话 worker 常驻持有约 1~1.5GB 内存,并行多个 worktree 会各自长出一个常驻进程,容易撑爆内存。默认路径(不设置任何 worker 开关)任何运行都不会留下常驻进程。
+
+在"编辑几个文件 → 再跑一次 typecheck"的本地循环里,连缓存命中路径的冷启动地板(进程启动 + 指纹 ≈ 0.2s)与增量路径的冷启动都可以省掉。为此 vue-tsc-go 提供**按需拉起、空闲自退的常驻会话 worker**(`bin/worker.js`),仅在显式要求时启动:
 
 ```
 CLI 进程（每次运行都是新进程）                 会话 worker（bin/worker.js，按需常驻）
 ─────────────────────────────                ─────────────────────────────────────
 1. 指纹: tsconfig 链 + argv + env + 全部      常驻持有:
-   根文件内容哈希（~0.26s @ element-plus）      - Module hook + vue-tsc + tsc bundle（Volar 管线）
+   根文件内容哈希（mtime+size 快筛,~0.19s @ element-plus）      - Module hook + vue-tsc + tsc bundle（Volar 管线）
 2. 解析 worker 命名管道,连接（不在则             - 进程内 Go 引擎会话（project/overlay 缓存跨运行复用）
    后台拉起一个,与指纹计算并行）                - 上次运行的会话状态（program 文件清单/解析图/逐文件诊断）
 3. 发送 {argv, plan} 请求,按序取回
@@ -115,9 +117,9 @@ worker 内的三种路径,输出与全量跑逐字节一致（与磁盘缓存同
 
 | 开关 | 说明 |
 |---|---|
-| （默认） | 仅在 stdout 为 TTY 的交互终端启用（CI / npm scripts 等非 TTY 环境自动不用 worker） |
-| `VUE_TSC_GO_WORKER=1` | 强制启用（非 TTY 环境如需使用设置此项） |
-| `--no-worker` / `VUE_TSC_GO_NO_WORKER=1` | 禁用,行为与升级前完全一致 |
+| （默认） | **不启用 worker**——不拉起、不连接任何常驻进程,行为与单进程流程完全一致 |
+| `VUE_TSC_GO_WORKER=1` 或 `--worker` | 显式启用(实验特性) |
+| `--no-worker` / `VUE_TSC_GO_NO_WORKER=1` | 即使 opt-in 也禁用 |
 | `VUE_TSC_GO_WORKER_IDLE_MS` | 空闲自退时间,默认 600000（10 分钟） |
 | `--clear-cache` | 同时结束该项目注册的所有 worker |
 
@@ -127,13 +129,13 @@ worker 是**按需 worker,不是 watch 常驻**:不做文件系统监听、不�
 
 
 
-缓存 miss(冷跑)时,checker 进程内同时驻留 Go 运行时(tsgo 引擎,峰值大头)与 V8 堆(vue-tsc + Volar 虚拟代码)。CLI 在拉起 checker 时自动施加两组**仅影响 GC 行为、不影响诊断输出**的参数(`bin/vue-tsc-go.js`):
+缓存 miss(冷跑)时,检查器与 CLI 同进程,同时驻留 Go 运行时(tsgo 引擎,峰值大头)与 V8 堆(vue-tsc + Volar 虚拟代码)。CLI 在加载 bridge 的 Go 插件前自动施加两组**仅影响 GC 行为、不影响诊断输出**的参数(`bin/vue-tsc-go.js`):
 
 - **`GOGC=30`**:Go 堆默认按活数据的 2 倍(=100%)扩到下次 GC;降到 30% 让 Go 侧更早回收。实测 element-plus 冷跑峰值降约 9-10%。
-- **Node `--max-semi-space-size=4`**:缩小 V8 年轻代上限,促使对象更早晋升/整理。
-- **`GODEBUG=asyncpreemptoff=1`** 在进程 spawn 时就位(与 bridge 自身行为一致,仅更可靠),避免 Go 运行时后台抢占。
+- **Node `--max-semi-space-size=4`**:缩小 V8 年轻代上限,促使对象更早晋升/整理(仅在 `--no-cache` 路径通过一次性 re-exec 携带;缓存路径为保持单进程不 re-exec)。
+- **`GODEBUG=asyncpreemptoff=1`** 在 Go 运行时初始化前就位,避免后台抢占。
 
-参数作用范围:缓存 miss 的 checker 子进程与 `--no-cache` 运行(后者通过一次性自 re-exec 携带,stdio/退出码透传)。**缓存命中路径完全不受影响**(无 re-exec、无额外开销)。
+参数作用范围:缓存路径在进程内直接生效;`--no-cache` 运行通过一次性自 re-exec 携带(stdio/退出码透传)。**缓存命中路径完全不受影响**(无 re-exec、无额外开销)。
 
 覆盖方式(均可用环境变量调整/关闭):
 
@@ -144,22 +146,43 @@ worker 是**按需 worker,不是 watch 常驻**:不做文件系统监听、不�
 
 实测(5 轮中位数,Windows 10,Node 22):element-plus 1562→1423MB、vueuse 1083→970MB、vben 2011→1843MB,耗时增幅 ≤7%。注意:checker 峰值的主体是 tsgo 引擎的 Go 活跃堆(~live×1.3)与 V8 堆(~400MB 级)的固有驻留,这两个 GC 旋钮只能压缩 GC 余量,无法把峰值压到与单 V8 堆实现的原版 vue-tsc 相同水平(vueuse 已接近,element-plus/vben 仍高 17-23%)。更激进手段(`GOMEMLIMIT` 软限、`GOGC≤20`)实测会引发 GC 风暴,耗时劣化 12-45%,不予采用。
 
-### 增量缓存
+### 增量缓存(两级,子程序优先)
 
-默认缓存已升级为增量级:对项目做少量修改后再跑 `vue-tsc-go`,只重新检查被改文件及其反向依赖闭包(与 `tsc --incremental` 相同的受影响集语义),其余文件的诊断从上次结果重放,输出与全量检查逐字节一致(含新错误的行列与退出码)。失效规则保守:新增/删除文件、全局脚本与模块增强(`declare global`/`declare module`)相关改动、node_modules 变化、受影响面超过项目 40% 等情形自动回退全量;任何内部异常也回退全量,只影响速度不影响正确性。缓存条目(v2)额外保存模块解析图与逐文件诊断;`.vue-global-types` 等生成文件的 mtime 抖动不会再造成误失效。
+默认缓存已升级为增量级:对项目做少量修改后再跑 `vue-tsc-go`,按两级策略处理,任何一级有任何疑虑都保守回退到下一级,输出与全量检查逐字节一致(含新错误的行列与退出码):
 
-实测(element-plus / vueuse / vben,与全量跑及原版输出逐字节一致):叶子文件改动后 1.7–2.6s(全量冷跑 3.9s、原版 10s);枢纽共享文件(反向依赖 100+)回退全量(约 3.3s);还原改动后回到命中路径 0.2–0.27s。
+- **一级·子程序增量**:不为改动重建全量 program,而是以受影响文件为根取**前向传递导入闭包**,加上全局声明/ambient 风险文件(全局脚本、`declare global`/`declare module`、UMD global,来自上次条目的元数据),生成一个临时兄弟 tsconfig(`extends` 原配置、显式绝对 `files`、清空 include/exclude),只对这个小子程序跑受影响文件的诊断,其余文件的诊断从上次条目重放。运行后做守卫校验(受影响文件必须都在子程序内、未改动文件的模块解析必须与全量一致、program 不得引入未知文件等),任一不满足即丢弃结果回退。
+- **二级·全量程序增量**:重建完整 program,但只对受影响闭包逐文件重查,其余文件诊断重放(上一版默认路径)。
+- **兜底·全量**:新增/删除文件、全局脚本与模块增强(`declare global`/`declare module`)相关改动、node_modules 变化、受影响面超过项目 40% 等情形自动全量;任何内部异常也回退全量,只影响速度不影响正确性。
+
+缓存条目(v2)额外保存模块解析图、逐文件语义/语法诊断与 ambient 风险分类;`.vue-global-types` 等生成文件的 mtime 抖动不会再造成误失效。子程序方案下,小改动路径不重建全量检查器状态,峰值内存约为全量冷跑的一半(见下)。
+
+实测(5 轮中位,Windows 10,Node 22;与全量跑及原版输出逐字节一致):
+
+| 项目 | 场景 | 小改动(子程序) | 全量冷跑 | 无改动命中 |
+|---|---|---|---|---|
+| element-plus | 叶子 .ts(反向依赖 14) | 2.4-2.5s / 742MB(全量的 0.51 倍) | 3.9s / 1440MB | 0.25s |
+| element-plus | 共享 .vue(button,反向依赖 104) | 3.2s(子程序仍命中) | 3.9s | 0.25s |
+| vueuse | 叶子 .ts(闭包 5) | 1.3s / 542MB(0.51 倍) | 2.4s / 1070MB | 0.24s |
+| vben web-antd | 页面 .vue | 2.2s / 919MB(0.50 倍) | 4.6s / 1870MB | 0.22s |
+| vueuse | 大桶文件(闭包 630) | 回退全量(约 2.4s) | 2.4s | 0.24s |
+
+子程序的时间大头是 Go 引擎构建受影响闭包的 program(element-plus 叶子改动的闭包仍有 ~1577 个文件,约占全量 87%,这是项目 import 图的固有密度),因此 element-plus 的小改动约 2.4-2.5s,未达 2.2s 的期望目标;内存 0.50-0.53 倍基本达成理想线(进一步压低需要更小的闭包,GOGC/GOMEMLIMIT 调优实测无效——峰值由活跃堆决定)。
 
 ## 自测
 
 ```bash
-npm test   # 三部分:
-           # 1) selftest:对 test/fixture(tsconfig + .vue + .ts 含类型错误)运行,
-           #    校验 .vue 被检查、错误行列指向 .vue 源文件、退出码为 2;
-           # 2) cache.test:在临时副本上校验缓存命中/字节一致回放、编辑失效、
-           #    mtime 重校验、--cache-dir / --clear-cache / --no-cache;
-           # 3) mutation.test:随机变异(fixture,默认种子 25/25)每轮
-           #    "缓存跑(增量/全量/命中) === --no-cache 跑"逐字节一致
+npm test          # 默认套件(零常驻,不启动任何 worker):
+                  # 1) selftest:对 test/fixture(tsconfig + .vue + .ts 含类型错误)运行,
+                  #    校验 .vue 被检查、错误行列指向 .vue 源文件、退出码为 2;
+                  # 2) cache.test:在临时副本上校验缓存命中/字节一致回放、编辑失效、
+                  #    mtime 重校验、--cache-dir / --clear-cache / --no-cache;
+                  # 3) mutation.test:随机变异(fixture,覆盖 .ts/.vue/桶文件/类型文件/
+                  #    深共享模块/declare global/生成文件,默认 30 轮)每轮
+                  #    "缓存跑(子程序增量/全量增量/全量/命中) === --no-cache 跑"逐字节一致
+
+npm run test:worker  # worker 实验特性测试(显式 opt-in VUE_TSC_GO_WORKER=1,结束后清理 worker):
+                     # mutation-worker.test(worker 路径 25 轮逐字节一致)+ robustness.test
+                     # (kill -9 恢复 / 并发不串扰 / 空闲自退)
 ```
 
-`test/perf.ps1` 用于测量墙钟时间与峰值内存(含子进程树)。
+`test/perf.ps1` 测量单次运行的墙钟时间与峰值内存(含子进程树);`test/perf-scenarios.ps1` 输出 nocache-full / cache-miss-full / cache-hit / small-change 四场景各 5 轮的中位数;`test/incremental.bench.js` 在三个基准项目上做场景化字节一致性与计时;`test/bench-consistency.js` 比对 worker 路径/磁盘命中/--no-cache 的逐字节一致性。

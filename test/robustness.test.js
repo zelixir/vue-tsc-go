@@ -21,7 +21,7 @@ const check = (cond, msg) => { if (!cond) failures.push(msg); console.log((cond 
 
 function run(env, extraArgs) {
   const res = spawnSync(process.execPath, [BIN, ...(extraArgs || []), "--noEmit"], {
-    cwd: FIXTURE, env: { ...process.env, ...env }, encoding: "buffer",
+    cwd: FIXTURE, env: { ...process.env, VUE_TSC_GO_WORKER_IDLE_MS: "15000", ...env }, encoding: "buffer",
     maxBuffer: 16 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
   });
   return {
@@ -92,6 +92,15 @@ async function main() {
   } catch (e) {
     failures.push("threw: " + e);
   } finally {
+    // kill every worker registered under CACHE before removing the meta dir,
+    // so no resident worker survives the test run
+    for (const m of workerMetas()) {
+      try { process.kill(m.pid); } catch {}
+    }
+    await sleep(300);
+    for (const m of workerMetas()) {
+      try { process.kill(m.pid, "SIGKILL"); } catch {}
+    }
     try { fs.rmSync(CACHE, { recursive: true, force: true }); } catch {}
   }
 

@@ -313,8 +313,65 @@ const INCR_HELPERS = `
     tnbSessionReset();
     let proj = proj0;
     try { proj = liveProject(); } catch {}
-    const tnbIncFile = process.env.VUE_TSC_GO_INCREMENTAL;
     const tnbSyntactic = kind === "syntactic";
+    // ── sub-program mode (VUE_TSC_GO_SUBPROGRAM, see bin/cache-incremental.js):
+    // the program was built from only the affected closure + ambient globals;
+    // fresh per-file diagnostics for the affected files, cached (rehydrated)
+    // diagnostics for everything else — including cached files that are not
+    // part of the sub-program at all. Any failure here means the returned
+    // multiset would be wrong (a whole-sub-program pass is NOT a valid
+    // fallback), so record the failure via VUE_TSC_GO_INCREMENTAL_ERR and let
+    // the parent redo the run on the full program.
+    const tnbSubFile = process.env.VUE_TSC_GO_SUBPROGRAM;
+    if (tnbSubFile) {
+      try {
+        const tnbFs = require("node:fs");
+        const tnbMan = JSON.parse(tnbFs.readFileSync(tnbSubFile, "utf8"));
+        if (tnbSyntactic && !tnbMan.cachedSyntactic) throw new Error("sub-program: no cached syntactic diagnostics");
+        const tnbAffected = new Set(tnbMan.affected);
+        const tnbCachedMap = tnbSyntactic ? tnbMan.cachedSyntactic : tnbMan.cached;
+        const tnbFreshDumpPath = tnbSyntactic ? tnbMan.freshSyntacticDump : tnbMan.freshDump;
+        const tnbPerFile = tnbSyntactic ? getSyntacticDiagnosticsForFile : getSemanticDiagnosticsForFile;
+        const tnbFresh = {};
+        const tnbResult = [];
+        const tnbInProgram = /* @__PURE__ */ new Set();
+        for (const tnbName of getSourceFileNames()) {
+          const tnbCn = tnbCanonName(tnbName);
+          tnbInProgram.add(tnbCn);
+          if (tnbAffected.has(tnbCn)) {
+            const tnbDiags = tnbPerFile(proj, tnbName);
+            tnbResult.push(...tnbDiags);
+            tnbFresh[tnbCn] = tnbDiags.map(tnbSerializeDiag);
+          } else if (tnbCachedMap) {
+            for (const tnbS of tnbCachedMap[tnbCn] || []) {
+              const tnbD = tnbRehydrateDiag(tnbS);
+              if (tnbS[0] && !tnbD.file) throw new Error("rehydrated diagnostic lost its file: " + tnbS[0]);
+              tnbResult.push(tnbD);
+            }
+          }
+        }
+        if (tnbCachedMap) {
+          for (const tnbKey of Object.keys(tnbCachedMap)) {
+            if (tnbInProgram.has(tnbKey) || tnbAffected.has(tnbKey)) continue;
+            // a cached file that left the disk (deleted root, removed dep) must
+            // never be rehydrated: its stale diagnostics would resurface in the
+            // output as phantom errors, possibly at garbled positions
+            if (!tnbFs.existsSync(tnbKey)) continue;
+            for (const tnbS of tnbCachedMap[tnbKey]) {
+              const tnbD = tnbRehydrateDiag(tnbS);
+              if (tnbS[0] && !tnbD.file) throw new Error("rehydrated diagnostic lost its file: " + tnbS[0]);
+              tnbResult.push(tnbD);
+            }
+          }
+        }
+        if (tnbFreshDumpPath) tnbFs.writeFileSync(tnbFreshDumpPath, JSON.stringify(tnbFresh));
+        return tnbResult;
+      } catch (tnbSubE) {
+        try { if (process.env.VUE_TSC_GO_INCREMENTAL_ERR) require("node:fs").writeFileSync(process.env.VUE_TSC_GO_INCREMENTAL_ERR, String(tnbSubE && tnbSubE.stack || tnbSubE)); } catch {}
+        return tnbIncWhole(proj, kind);
+      }
+    }
+    const tnbIncFile = process.env.VUE_TSC_GO_INCREMENTAL;
     if (!tnbIncFile || (tnbSyntactic && !process.env.VUE_TSC_GO_MIX_SYNTACTIC)) return tnbIncWhole(proj, kind);
     try {
       const tnbFs = require("node:fs");
@@ -574,4 +631,67 @@ for (const base of ["typescript.js", "_tsc.js"]) {
 	src = src.replace(GRAPH_ANCHOR, GRAPH_ANCHOR + GRAPH_CODE);
 	fs.writeFileSync(file, src);
 	console.log(`${base}: graph patch applied`);
+}
+
+// ── Seventh pass: TNB-SUBPROG (both bundles) ─────────────────────────────────
+// Sub-program incremental runs (bin/cache-incremental.js prepareSubProgram):
+// when VUE_TSC_GO_SUBPROGRAM=<manifest> is set, the tsc driver builds the
+// program from the manifest's root list (affected closure + ambient globals)
+// instead of the full tsconfig file set. Everything else (options, resolution,
+// Volar proxy) is untouched, so the affected files are checked in exactly the
+// same type environment while the program stays small. Without the env var
+// this is a pass-through.
+const SUBPROG_MARKER = "TNB-SUBPROG";
+const SUBPROG_ANCHOR_RE = /const programOptions = \{\r?\n    rootNames: fileNames,\r?\n    options,\r?\n    projectReferences,\r?\n    host,\r?\n    configFileParsingDiagnostics: getConfigFileParsingDiagnostics\(config\)\r?\n  \};/;
+const SUBPROG_HELPERS = `// ── ${SUBPROG_MARKER}: sub-program root override (vue-tsc-go incremental tier 1) ──
+// The tsgo engine builds its program from options.configFilePath (the tsconfig
+// file), NOT from rootNames — so the sub-program tier points the driver at a
+// generated sibling tsconfig (written by bin/cache-incremental.js) whose
+// "files" list is the affected closure + ambient globals, "extends" the real
+// config. Resolution and vueCompilerOptions are therefore identical.
+var tnbSubProgramManifestMemo;
+function tnbSubProgramManifest() {
+  const tnbSubPath = process.env.VUE_TSC_GO_SUBPROGRAM;
+  if (!tnbSubPath) return null;
+  if (tnbSubProgramManifestMemo === void 0) {
+    try {
+      tnbSubProgramManifestMemo = JSON.parse(require("node:fs").readFileSync(tnbSubPath, "utf8"));
+    } catch (tnbSubE) {
+      tnbSubProgramManifestMemo = null;
+    }
+  }
+  return tnbSubProgramManifestMemo;
+}
+function tnbSubProgramRoots(fileNames) {
+  const tnbMan = tnbSubProgramManifest();
+  return tnbMan && Array.isArray(tnbMan.roots) && tnbMan.roots.length ? tnbMan.roots : fileNames;
+}
+function tnbSubProgramOptions(options) {
+  const tnbMan = tnbSubProgramManifest();
+  if (!tnbMan || !tnbMan.configPath) return options;
+  try {
+    return { ...options, configFilePath: require("node:path").resolve(tnbMan.configPath) };
+  } catch (tnbSubE) {
+    return options;
+  }
+}
+// ── end ${SUBPROG_MARKER} ──
+`;
+for (const base of ["typescript.js", "_tsc.js"]) {
+	const file = path.join(libDir, base);
+	let src = fs.readFileSync(file, "utf8");
+	// strip previously applied subprog patch so it can be replaced idempotently
+	src = src.replace(new RegExp(`// ── ${SUBPROG_MARKER}:[\\s\\S]*?── end ${SUBPROG_MARKER} ──\\r?\\n?`, "g"), "");
+	src = src.replace(/rootNames: tnbSubProgramRoots\(fileNames\),/g, "rootNames: fileNames,");
+	src = src.replace(/options: tnbSubProgramOptions\(options\),/g, "options,");
+	if (!SUBPROG_ANCHOR_RE.test(src)) {
+		console.error(`${base}: subprog anchor not found!`);
+		process.exit(1);
+	}
+	src = src.replace(SUBPROG_ANCHOR_RE, (m) => m
+		.replace("rootNames: fileNames,", "rootNames: tnbSubProgramRoots(fileNames),")
+		.replace(/(\r?\n)    options,(\r?\n)/, "$1    options: tnbSubProgramOptions(options),$2"));
+	src = src.replace("function performCompilation(sys2, cb, reportDiagnostic, config) {", SUBPROG_HELPERS + "function performCompilation(sys2, cb, reportDiagnostic, config) {");
+	fs.writeFileSync(file, src);
+	console.log(`${base}: subprog patch applied`);
 }

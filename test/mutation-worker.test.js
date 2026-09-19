@@ -31,7 +31,7 @@ const pick = (arr) => arr[Math.floor(rand() * arr.length)];
 function run(env) {
 	const res = spawnSync(process.execPath, [BIN, "--noEmit"], {
 		cwd: FIXTURE,
-		env: { ...process.env, ...env },
+		env: { ...process.env, VUE_TSC_GO_WORKER_IDLE_MS: "10000", ...env },
 		encoding: "buffer",
 		maxBuffer: 16 * 1024 * 1024,
 		stdio: ["ignore", "pipe", "pipe"],
@@ -45,7 +45,8 @@ function run(env) {
 }
 
 // ── mutation state (same rules as mutation.test.js) ─────────────────────────
-const BASE_FILES = ["helper.ts", "main.ts", "App.vue"];
+const BASE_FILES = ["helper.ts", "main.ts", "deep.ts", "barrel.ts", "types.ts", "App.vue", "widget.vue"];
+const TS_FILES = BASE_FILES.filter((f) => f.endsWith(".ts"));
 const backup = {};
 for (const f of BASE_FILES) backup[f] = fs.readFileSync(path.join(SRC, f), "utf8");
 const generated = new Set();
@@ -89,6 +90,28 @@ function addVueTemplateError(file) {
 	return () => fs.writeFileSync(p, text);
 }
 
+/** Type-declaration edit: flips WidgetShape.scale so the dependents' error
+ *  pattern inverts (deep.ts / widget.vue). */
+function changeTypeDecl() {
+	const p = path.join(SRC, "types.ts");
+	const text = fs.readFileSync(p, "utf8");
+	if (!text.includes("scale: number")) return () => {};
+	fs.writeFileSync(p, text.replace("scale: number", "scale: string"));
+	return () => fs.writeFileSync(p, text);
+}
+
+/** Global-scope augmentation: must force the conservative full-run fallback. */
+function addDeclareGlobal(file) {
+	const p = path.join(SRC, file);
+	const text = fs.readFileSync(p, "utf8");
+	const block = `\ndeclare global {\n\tinterface Window {\n\t\t__mutAug${Math.floor(rand() * 1e6)}?: boolean\n\t}\n}\n`;
+	fs.writeFileSync(p, text + block);
+	return () => {
+		const t = fs.readFileSync(p, "utf8");
+		fs.writeFileSync(p, t.replace(block, ""));
+	};
+}
+
 function addGeneratedFile(withImport) {
 	const name = `__mutgen${++genCounter}.ts`;
 	const exportsSomething = rand() < 0.5;
@@ -113,10 +136,17 @@ function mutate() {
 	const undos = [];
 	const n = 1 + Math.floor(rand() * 3);
 	for (let i = 0; i < n; i++) {
-		const op = pick(["error", "unerror", "comment", "comment", "genfile", "genfile-import", "delfile", "vue-error"]);
+		const op = pick(["error", "unerror", "comment", "comment", "genfile", "genfile-import", "delfile", "vue-error", "widget-error", "type-decl", "augment", "deep-error"]);
 		try {
-			if (op === "error") undos.push(addError(pick(BASE_FILES.filter((f) => f.endsWith(".ts")))));
+			if (op === "error") undos.push(addError(pick(TS_FILES)));
 			else if (op === "vue-error") undos.push(addVueTemplateError("App.vue"));
+			else if (op === "widget-error") undos.push(addVueTemplateError("widget.vue"));
+			else if (op === "type-decl") undos.push(changeTypeDecl());
+			else if (op === "deep-error") undos.push(addError("deep.ts"));
+			else if (op === "augment") {
+				const u = addDeclareGlobal(pick(TS_FILES));
+				if (typeof u === "function") undos.push(u);
+			}
 			else if (op === "unerror") {
 				const p = path.join(SRC, "helper.ts");
 				const text = fs.readFileSync(p, "utf8");

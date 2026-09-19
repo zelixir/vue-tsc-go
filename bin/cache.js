@@ -57,17 +57,18 @@ function extractCacheArgs(argv) {
 	const rest = [];
 	let cacheDir;
 	let clear = false;
-	let noWorker = false;
+	let worker = false;
 	for (let i = 0; i < argv.length; i++) {
 		const a = argv[i];
 		if (a === "--no-cache") continue;
 		if (a === "--clear-cache") { clear = true; continue; }
-		if (a === "--no-worker") { noWorker = true; continue; }
+		if (a === "--no-worker") continue; // worker is off by default; kept for compatibility
+		if (a === "--worker") { worker = true; continue; }
 		if (a === "--cache-dir") { cacheDir = argv[++i]; continue; }
 		if (a.startsWith("--cache-dir=")) { cacheDir = a.slice("--cache-dir=".length); continue; }
 		rest.push(a);
 	}
-	return { argv: rest, cacheDir, clear, noWorker };
+	return { argv: rest, cacheDir, clear, worker };
 }
 
 function resolveProjectConfigPath(argv, cwd) {
@@ -169,6 +170,13 @@ function sortedOptionsJson(options) {
 /**
  * Build the full cache plan for one invocation.
  * Returns { key, entryDir } on success, or { skip: reason } when caching must not apply.
+ *
+ * Root-file content hashing uses an mtime+size pre-screen against the previous
+ * run's stored stat snapshot (rootmeta.json): only files whose stat changed
+ * since the last run are re-read and re-hashed; unchanged files reuse the
+ * stored content hash. The final cache key is still a pure content-hash key —
+ * the pre-screen only avoids re-reading files that cannot have changed (any
+ * stat mismatch forces a fresh read+hash, so a content change is always seen).
  */
 function buildPlan({ argv, cwd, bridgeDir, packageDir, cacheDir }) {
 	if (hasUnsupportedArgs(argv)) return { skip: "unsupported-args" };
@@ -222,6 +230,17 @@ function buildPlan({ argv, cwd, bridgeDir, packageDir, cacheDir }) {
 		return { skip: "emit-mode" };
 	}
 
+	// dependency graph: root file set + content hashes. First take a stat
+	// snapshot (mtime+size) of every root file — this both feeds the pre-screen
+	// below and is stored in the entry as the next run's pre-screen source.
+	const tsconfigDirCache = resolveCacheDir(cacheDir, tsconfigPath);
+	const statByKey = new Map();
+	for (const f of parsed.fileNames) {
+		let st;
+		try { st = fs.statSync(f); } catch { return { skip: "unreadable-input:" + f }; }
+		statByKey.set(canonName(f), [st.size, Math.round(st.mtimeMs)]);
+	}
+
 	// toolchain identity
 	let bridgeVersion = "unknown";
 	try {
@@ -235,9 +254,9 @@ function buildPlan({ argv, cwd, bridgeDir, packageDir, cacheDir }) {
 		bridgeTypescriptJs: sha1File(path.join(bridgeDir, "lib", "typescript.js")),
 		bridgeTscJs: sha1File(path.join(bridgeDir, "lib", "_tsc.js")),
 		vueTscModule: (() => {
-		try { return require.resolve("vue-tsc", { paths: [cwd, packageDir] }); }
-		catch { return "unresolved"; }
-	})(),
+			try { return require.resolve("vue-tsc", { paths: [cwd, packageDir] }); }
+			catch { return "unresolved"; }
+		})(),
 		node: process.versions.node,
 		platform: process.platform,
 	};
@@ -253,15 +272,6 @@ function buildPlan({ argv, cwd, bridgeDir, packageDir, cacheDir }) {
 		vueExts,
 	};
 
-	// dependency graph: root file set + content hashes
-	const files = [];
-	for (const f of parsed.fileNames) {
-		let h;
-		try { h = sha1File(f); } catch { return { skip: "unreadable-input:" + f }; }
-		files.push([f.replace(/\\/g, "/"), h]);
-	}
-	files.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
-
 	// relevant env (pure debug switches must not invalidate the cache)
 	const env = {};
 	for (const [k, v] of Object.entries(process.env)) {
@@ -271,9 +281,55 @@ function buildPlan({ argv, cwd, bridgeDir, packageDir, cacheDir }) {
 	// baseKey: identity of everything except the input file contents — used to
 	// find the previous run's entry for incremental reuse (see cache-incremental.js)
 	const baseKey = sha1(JSON.stringify({ toolchain, config, env, argv }));
+
+	// content hashes with the mtime+size pre-screen: reuse the previous run's
+	// hash when the stat snapshot is unchanged; otherwise read + hash.
+	const prior = readLatestRootMeta(tsconfigDirCache, baseKey);
+	const priorHashes = prior ? new Map(prior.files.map(([f, h]) => [canonName(f), h])) : null;
+	const priorStats = prior && prior.fileStats ? prior.fileStats : null;
+	const files = [];
+	const fileStats = {};
+	for (const f of parsed.fileNames) {
+		const c = canonName(f);
+		const st = statByKey.get(c);
+		const priorStat = priorStats ? priorStats[c] : null;
+		let h;
+		if (priorStat && priorStat[0] === st[0] && priorStat[1] === st[1] && priorHashes && priorHashes.has(c)) {
+			h = priorHashes.get(c); // stat unchanged since the hashed run -> reuse
+		} else {
+			try { h = sha1File(f); } catch { return { skip: "unreadable-input:" + f }; }
+		}
+		files.push([f.replace(/\\/g, "/"), h]);
+		fileStats[c] = st;
+	}
+	files.sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+
 	const key = sha1(JSON.stringify({ toolchain, config, files, env, argv }));
 
-	return { key, baseKey, files, filesCount: files.length, tsconfigPath };
+	return { key, baseKey, files, fileStats, filesCount: files.length, tsconfigPath };
+}
+
+/** Sidecar next to the entries dir holding the last run's root stat snapshot. */
+function rootMetaPath(cacheDir) {
+	return path.join(cacheDir, "rootmeta.json");
+}
+
+function readLatestRootMeta(cacheDir, baseKey) {
+	if (!cacheDir || !baseKey) return null;
+	const m = readJson(rootMetaPath(cacheDir));
+	if (!m || m.baseKey !== baseKey || !Array.isArray(m.files)) return null;
+	return m;
+}
+
+function writeLatestRootMeta(cacheDir, meta) {
+	if (!cacheDir || !meta || !meta.baseKey || !Array.isArray(meta.files)) return;
+	const file = rootMetaPath(cacheDir);
+	const tmp = path.join(cacheDir, `.rootmeta.${process.pid}.${Date.now()}.tmp`);
+	try {
+		fs.mkdirSync(cacheDir, { recursive: true });
+		fs.writeFileSync(tmp, JSON.stringify(meta), { flag: "wx" });
+		fs.renameSync(tmp, file); // atomic on same volume
+	} catch {} // best-effort hint only
 }
 
 function resolveCacheDir(requested, tsconfigPath) {
@@ -339,22 +395,35 @@ function canonName(p) {
 }
 
 /**
- * Content hashes for the non-root program files (node_modules d.ts, generated
- * files like Volar's .vue-global-types). Needed because some generated files
- * are rewritten (fresh mtime, identical content) on every checker run, so
- * mtime/size verification alone misfires; a sha1 comparison settles it.
+ * Content hashes + ambient-risk classification for the non-root program files
+ * (node_modules d.ts, generated files like Volar's .vue-global-types). Needed
+ * because some generated files are rewritten (fresh mtime, identical content)
+ * on every checker run, so mtime/size verification alone misfires; a sha1
+ * comparison settles it. The risk classification (see cache-incremental.js)
+ * feeds the sub-program incremental tier.
  */
-function computeFileHashes(programFiles, rootSet) {
+function computeFileMeta(programFiles, rootSet) {
+	const { isAmbientRiskyText } = require("./cache-incremental.js");
 	const hashes = {};
+	const risky = [];
 	for (const [file] of programFiles || []) {
 		const c = canonName(file);
 		if (rootSet.has(c)) continue;
+		let content;
 		try {
-			const content = fs.readFileSync(file);
-			hashes[c] = sha1(content);
+			content = fs.readFileSync(file);
 		} catch {} // unreadable -> omitted; stat check stays authoritative
+		if (content === undefined) continue;
+		hashes[c] = sha1(content);
+		try {
+			if (isAmbientRiskyText(content.toString("utf8"))) risky.push(c);
+		} catch {}
 	}
-	return hashes;
+	return { hashes, risky };
+}
+
+function computeFileHashes(programFiles, rootSet) {
+	return computeFileMeta(programFiles, rootSet).hashes;
 }
 
 function writeEntry(cacheDir, key, payload) {
@@ -374,6 +443,8 @@ function writeEntry(cacheDir, key, payload) {
 			syntacticDiags: payload.syntacticDiags || null,
 			flags: payload.flags || null,
 		fileHashes: payload.fileHashes || null,
+		fileStats: payload.fileStats || null,
+		programRisky: payload.programRisky || null,
 	};
 	const dir = path.join(cacheDir, "entries");
 	const file = entryPath(cacheDir, key);
@@ -381,6 +452,12 @@ function writeEntry(cacheDir, key, payload) {
 	fs.mkdirSync(dir, { recursive: true });
 	fs.writeFileSync(tmp, JSON.stringify(entry), { flag: "wx" });
 	fs.renameSync(tmp, file); // atomic on same volume
+	// sidecar hint for the next run's fingerprint pre-screen (best effort)
+	writeLatestRootMeta(cacheDir, {
+		baseKey: entry.baseKey,
+		files: payload.files || null,
+		fileStats: payload.fileStats || null,
+	});
 	// opportunistic pruning, best effort
 	try {
 		const names = fs.readdirSync(dir).filter(n => n.endsWith(".json"));
@@ -415,7 +492,11 @@ function verifyProgramFiles(entry) {
 }
 
 function clearCache(cacheDir) {
-	try { fs.rmSync(path.join(cacheDir, "entries"), { recursive: true, force: true }); return true; } catch { return false; }
+	try {
+		fs.rmSync(path.join(cacheDir, "entries"), { recursive: true, force: true });
+		removeQuiet(rootMetaPath(cacheDir));
+		return true;
+	} catch { return false; }
 }
 
 function readJson(file) {
@@ -449,17 +530,21 @@ function handleMiss({ argv, cacheDir, plan, spawnChild, dumpTmpBase, debug }) {
 	const progDump = dumpTmpBase + ".progfiles.json";
 	const graphDump = dumpTmpBase + ".graph.json";
 	const diagDump = dumpTmpBase + ".diags.json";
+	const synDump = dumpTmpBase + ".syndiags.json";
 	const result = spawnChild(argv, {
 		VUE_TSC_GO_INTERNAL_CHILD: "1",
 		VUE_TSC_GO_DUMP_FILES: progDump,
 		VUE_TSC_GO_DUMP_GRAPH: graphDump,
 		VUE_TSC_GO_DUMP_DIAGS: diagDump,
+		VUE_TSC_GO_DUMP_SYNDIAGS: synDump,
 	});
 	if (result.spawnError) return { mode: "full", spawnError: result.spawnError, stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
 	const programFiles = readJson(progDump);
 	const graphDumped = readJson(graphDump);
 	const diagsDumped = readJson(diagDump);
+	const synDumped = readJson(synDump);
 	const rootSet = new Set(plan.files.map(([f]) => canonName(f)));
+	const meta = programFiles ? computeFileMeta(programFiles, rootSet) : { hashes: null, risky: null };
 	try {
 		writeEntry(cacheDir, plan.key, {
 			stdoutBase64: Buffer.from(result.stdout, "utf8").toString("base64"),
@@ -468,9 +553,12 @@ function handleMiss({ argv, cacheDir, plan, spawnChild, dumpTmpBase, debug }) {
 			programFiles,
 			baseKey: plan.baseKey,
 			files: plan.files || null,
+			fileStats: plan.fileStats || null,
 			graph: graphDumped ? inc.canonEdges(graphDumped.edges) : null,
 			fileDiags: diagsDumped && !diagsDumped.fileless ? diagsDumped.byFile : null,
-			fileHashes: programFiles ? computeFileHashes(programFiles, rootSet) : null,
+			syntacticDiags: synDumped && !synDumped.fileless ? synDumped.byFile : null,
+			fileHashes: meta.hashes,
+			programRisky: meta.risky,
 			flags: plan.files
 				? {
 					...inc.computeRootFlags(plan.files),
@@ -483,6 +571,7 @@ function handleMiss({ argv, cacheDir, plan, spawnChild, dumpTmpBase, debug }) {
 	removeQuiet(progDump);
 	removeQuiet(graphDump);
 	removeQuiet(diagDump);
+	removeQuiet(synDump);
 	return { mode: "full", stdout: result.stdout, stderr: result.stderr, exitCode: result.exitCode };
 }
 
@@ -498,6 +587,10 @@ module.exports = {
 	isEntryUsable,
 	handleMiss,
 	computeFileHashes,
+	computeFileMeta,
+	canonName,
+	readLatestRootMeta,
+	writeLatestRootMeta,
 	clearCache,
 	sha1,
 };

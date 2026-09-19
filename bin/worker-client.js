@@ -25,17 +25,19 @@ function sha1(data) {
 }
 
 /**
- * Worker gating: opt-in via VUE_TSC_GO_WORKER=1, otherwise enabled only on an
- * interactive terminal (stdout TTY). Explicitly disabled by --no-worker /
- * VUE_TSC_GO_NO_WORKER=1 and in CI (CI=true is non-TTY anyway). Also requires
- * a writable cache dir (the worker coordination files live there).
+ * Worker gating: STRICT opt-in. The default (no flag, no env) never spawns or
+ * contacts a resident worker — multiple parallel worktrees would each grow a
+ * ~1GB-class resident process, which is unacceptable, so the worker is an
+ * experimental feature that must be requested explicitly via
+ * VUE_TSC_GO_WORKER=1 (env) or the --worker CLI flag. --no-worker /
+ * VUE_TSC_GO_NO_WORKER=1 disables it even when opted in.
  */
-function workerAllowed({ env, isTTY }) {
+function workerAllowed({ env, explicit }) {
 	const no = String(env.VUE_TSC_GO_NO_WORKER || "").toLowerCase();
 	if (no === "1" || no === "true" || no === "yes") return false;
+	if (explicit) return true;
 	const yes = String(env.VUE_TSC_GO_WORKER || "").toLowerCase();
-	if (yes === "1" || yes === "true" || yes === "yes") return true;
-	return !!isTTY;
+	return yes === "1" || yes === "true" || yes === "yes";
 }
 
 function workerDir(cacheDir) {
