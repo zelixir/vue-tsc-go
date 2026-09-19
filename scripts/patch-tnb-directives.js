@@ -276,8 +276,7 @@ const INCR_HELPERS = `
     reportsDeprecated: s[7] || void 0,
     relatedInformation: s[8] ? s[8].map(tnbRehydrateDiag) : void 0,
   });
-  const tnbDumpDiagsByFile = (diags) => {
-    const tnbDumpPath = process.env.VUE_TSC_GO_DUMP_DIAGS;
+  const tnbDumpDiagsByFileTo = (diags, tnbDumpPath) => {
     if (!tnbDumpPath || !diags) return diags;
     try {
       const tnbFs = require("node:fs");
@@ -295,24 +294,45 @@ const INCR_HELPERS = `
     }
     return diags;
   };
-  const tnbSemanticDiagnosticsHook = (proj) => {
-    const tnbWhole = () => tnbDumpDiagsByFile(mapTsgoDiagsAligned(proj.program.getSemanticDiagnostics()));
+  const tnbDumpDiagsByFile = (diags) => tnbDumpDiagsByFileTo(diags, process.env.VUE_TSC_GO_DUMP_DIAGS);
+  const tnbSessionReset = () => {
+    if (globalThis.__tnbResetDiagCaches === true) {
+      try { perFileDiagCache && (perFileDiagCache.semantic.clear(), perFileDiagCache.syntactic.clear()); } catch {}
+      try { programDiagnosticsCache = void 0; globalDiagnosticsCache = void 0; declarationDiagnosticsCache = void 0; } catch {}
+      try { const tnbSync = _overlaySyncByConfig.get(configFilePath); if (tnbSync) tnbSync(); } catch {}
+      globalThis.__tnbResetDiagCaches = false;
+    }
+  };
+  const tnbIncWhole = (proj, kind) => tnbDumpDiagsByFileTo(
+    mapTsgoDiagsAligned(kind === "syntactic"
+      ? proj.program.getSyntacticDiagnostics()
+      : proj.program.getSemanticDiagnostics()),
+    kind === "syntactic" ? process.env.VUE_TSC_GO_DUMP_SYNDIAGS : process.env.VUE_TSC_GO_DUMP_DIAGS,
+  );
+  const tnbIncHook = (proj0, kind) => {
+    tnbSessionReset();
+    let proj = proj0;
+    try { proj = liveProject(); } catch {}
     const tnbIncFile = process.env.VUE_TSC_GO_INCREMENTAL;
-    if (!tnbIncFile) return tnbWhole();
+    const tnbSyntactic = kind === "syntactic";
+    if (!tnbIncFile || (tnbSyntactic && !process.env.VUE_TSC_GO_MIX_SYNTACTIC)) return tnbIncWhole(proj, kind);
     try {
       const tnbFs = require("node:fs");
       const tnbMan = JSON.parse(tnbFs.readFileSync(tnbIncFile, "utf8"));
       const tnbAffected = new Set(tnbMan.affected);
+      const tnbCachedMap = tnbSyntactic ? tnbMan.cachedSyntactic : tnbMan.cached;
+      const tnbFreshDumpPath = tnbSyntactic ? tnbMan.freshSyntacticDump : tnbMan.freshDump;
+      const tnbPerFile = tnbSyntactic ? getSyntacticDiagnosticsForFile : getSemanticDiagnosticsForFile;
       const tnbFresh = {};
       const tnbResult = [];
       for (const tnbName of getSourceFileNames()) {
         const tnbCn = tnbCanonName(tnbName);
         if (tnbAffected.has(tnbCn)) {
-          const tnbDiags = getSemanticDiagnosticsForFile(proj, tnbName);
+          const tnbDiags = tnbPerFile(proj, tnbName);
           tnbResult.push(...tnbDiags);
           tnbFresh[tnbCn] = tnbDiags.map(tnbSerializeDiag);
         } else {
-          const tnbCached = tnbMan.cached[tnbCn];
+          const tnbCached = tnbCachedMap && tnbCachedMap[tnbCn];
           if (tnbCached) {
             for (const tnbS of tnbCached) {
               const tnbD = tnbRehydrateDiag(tnbS);
@@ -322,13 +342,15 @@ const INCR_HELPERS = `
           }
         }
       }
-      if (tnbMan.freshDump) tnbFs.writeFileSync(tnbMan.freshDump, JSON.stringify(tnbFresh));
+      if (tnbFreshDumpPath) tnbFs.writeFileSync(tnbFreshDumpPath, JSON.stringify(tnbFresh));
       return tnbResult;
     } catch (tnbIncE) {
       try { if (process.env.VUE_TSC_GO_INCREMENTAL_ERR) require("node:fs").writeFileSync(process.env.VUE_TSC_GO_INCREMENTAL_ERR, String(tnbIncE && tnbIncE.stack || tnbIncE)); } catch {}
-      return tnbWhole();
+      return tnbIncWhole(proj, kind);
     }
   };
+  const tnbSemanticDiagnosticsHook = (proj) => tnbIncHook(proj, "semantic");
+  const tnbSyntacticDiagnosticsHook = (proj) => tnbIncHook(proj, "syntactic");
   // ── end ${INCR_MARKER} ──`;
 
 // The no-arg semantic call inside the tsgo program wrapper (exact text after
@@ -349,6 +371,25 @@ const INCR_CALL_SITE_REPLACED = [
 	"      return tnbSemanticDiagnosticsHook(proj);",
 	"    },",
 ].join("\n");
+// syntactic: the tsc driver queries the whole program's syntactic diagnostics
+// before the semantic ones — this is the FIRST engine query of every run, so
+// the per-session reset/overlay-sync piggybacks on the syntactic hook.
+const SYN_CALL_SITE = [
+	"    getSyntacticDiagnostics: (sourceFile) => {",
+	"      var _a10, _b2;",
+	"      const proj = liveProject();",
+	"      if (sourceFile == null ? void 0 : sourceFile.fileName) return getSyntacticDiagnosticsForFile(proj, sourceFile.fileName);",
+	"      return mapTsgoDiagsAligned((_b2 = (_a10 = proj.program).getSyntacticDiagnostics) == null ? void 0 : _b2.call(_a10));",
+	"    },",
+].join("\n");
+const SYN_CALL_SITE_REPLACED = [
+	"    getSyntacticDiagnostics: (sourceFile) => {",
+	"      var _a10, _b2;",
+	"      const proj = liveProject();",
+	"      if (sourceFile == null ? void 0 : sourceFile.fileName) return getSyntacticDiagnosticsForFile(proj, sourceFile.fileName);",
+	"      return tnbSyntacticDiagnosticsHook(proj);",
+	"    },",
+].join("\n");
 
 for (const base of ["typescript.js", "_tsc.js"]) {
 	const file = path.join(libDir, base);
@@ -356,6 +397,7 @@ for (const base of ["typescript.js", "_tsc.js"]) {
 	// strip previously applied incr patch so it can be replaced idempotently
 	src = src.replace(/\/\/ ── TNB-INCRPATCH[\s\S]*?── end TNB-INCRPATCH ──\r?\n?/, "");
 	src = src.replace(INCR_CALL_SITE_REPLACED, INCR_CALL_SITE);
+	src = src.replace(SYN_CALL_SITE_REPLACED, SYN_CALL_SITE);
 	if (!src.includes(INCR_ANCHOR)) {
 		console.error(`${base}: incr anchor not found (directive patch must run first)!`);
 		process.exit(1);
@@ -364,8 +406,13 @@ for (const base of ["typescript.js", "_tsc.js"]) {
 		console.error(`${base}: incr call site not found!`);
 		process.exit(1);
 	}
+	if (!src.includes(SYN_CALL_SITE)) {
+		console.error(`${base}: syntactic call site not found!`);
+		process.exit(1);
+	}
 	src = src.replace(INCR_ANCHOR, INCR_ANCHOR + INCR_HELPERS);
 	src = src.replace(INCR_CALL_SITE, INCR_CALL_SITE_REPLACED);
+	src = src.replace(SYN_CALL_SITE, SYN_CALL_SITE_REPLACED);
 	fs.writeFileSync(file, src);
 	console.log(`${base}: incr patch applied`);
 }
@@ -408,6 +455,110 @@ const GRAPH_CODE = `
     }
   }
   // ── end ${GRAPH_MARKER} ──`;
+
+// ── Fifth pass: TNB-WORKERSCAN (both bundles) ───────────────────────────────
+// The directive-alignment layer caches per-file text + directive scans forever
+// (tnbDirectiveScanCache). In a resident session worker the same file can be
+// checked with *changed* content in a later run, so the worker resets the
+// cache before every run via a global flag. (In one-shot processes the flag is
+// never set and behavior is unchanged.)
+const SCAN_MARKER = "__tnbScanCacheReset";
+for (const base of ["typescript.js", "_tsc.js"]) {
+	const file = path.join(libDir, base);
+	let src = fs.readFileSync(file, "utf8");
+	if (!src.includes(SCAN_MARKER)) {
+		const scanAnchor = "  function tnbGetDirectiveScan(hostFileName) {\n    if (tnbDirectiveScanCache.has(hostFileName)) return tnbDirectiveScanCache.get(hostFileName);";
+		if (!src.includes(scanAnchor)) {
+			console.error(`${base}: scan-cache anchor not found (directive patch must run first)!`);
+			process.exit(1);
+		}
+		src = src.replace(
+			scanAnchor,
+			"  function tnbGetDirectiveScan(hostFileName) {\n" +
+			"    if (globalThis.__tnbScanCacheReset === true) { try { tnbDirectiveScanCache.clear(); } catch {} globalThis.__tnbScanCacheReset = false; }\n" +
+			"    if (tnbDirectiveScanCache.has(hostFileName)) return tnbDirectiveScanCache.get(hostFileName);",
+		);
+		fs.writeFileSync(file, src);
+		console.log(`${base}: scan-cache reset hook applied`);
+	}
+}
+
+// ── Sixth pass: TNB-WORKERPASS (_tsc.js only) ────────────────────────────────
+// Resident worker support: instead of executing the command line at module
+// load, the bundle exposes { sys, executeCommandLine } so the session
+// worker (bin/worker.js) can run many checks in-process against one persistent
+// Go engine session (project/overlay caches live in process-level state).
+const WORKER_MARKER = "TNB-WORKERPASS";
+const WORKER_BOTTOM = "executeCommandLine(sys, noop, sys.args);";
+// banner: in worker mode the resident worker suppresses the one-shot stderr
+// announcement (its stderr is not a user terminal) and instead prepends a
+// byte-identical banner synthesized from the requesting CLI's stderr TTY state
+// (see bin/worker.js runOnce), so output matches a fresh full run exactly.
+const BANNER_FROM_RE = /if \(!_tnbDebugAnnounced( && process\.env\.VUE_TSC_GO_WORKER(_ROLE)? !== "1")?\) \{/;
+const BANNER_TO_TEXT = "if (!_tnbDebugAnnounced && process.env.VUE_TSC_GO_WORKER_ROLE !== \"1\") {";
+for (const base of ["typescript.js", "_tsc.js"]) {
+	const file = path.join(libDir, base);
+	let src = fs.readFileSync(file, "utf8");
+	if (!src.includes(BANNER_TO_TEXT)) {
+		if (!BANNER_FROM_RE.test(src)) {
+			console.error(`${base}: banner anchor not found!`);
+			process.exit(1);
+		}
+		src = src.replace(BANNER_FROM_RE, BANNER_TO_TEXT);
+		fs.writeFileSync(file, src);
+		console.log(`${base}: worker banner suppression applied`);
+	}
+}
+// reset code in the per-file diagnostic wrapper (same closure scope as the
+// diagnostic caches) so the session worker can evict stale per-proj caches at
+// the start of every run (a fresh child process starts with empty caches).
+const PERFILE_RESET_MARKER = "__tnbResetDiagCaches";
+const PERFILE_TO = "globalThis.__tnbResetDiagCaches === true) {\r\n      try { perFileDiagCache";
+const PERFILE_FROM_RE =/getSemanticDiagnosticsForFile = \(proj, fileName\) => \{\r?\n/;
+function perFileResetBlock() {
+	const indent = "    ";
+	return "getSemanticDiagnosticsForFile = (proj, fileName) => {\r\n" +
+		indent + "if (globalThis.__tnbResetDiagCaches === true) {\r\n" +
+		indent + "  try { perFileDiagCache && (perFileDiagCache.semantic.clear(), perFileDiagCache.syntactic.clear()); } catch {}\r\n" +
+		indent + "  try { programDiagnosticsCache = void 0; globalDiagnosticsCache = void 0; declarationDiagnosticsCache = void 0; } catch {}\r\n" +
+		indent + "  globalThis.__tnbResetDiagCaches = false;\r\n" +
+		indent + "}\r\n";
+}
+for (const base of ["typescript.js", "_tsc.js"]) {
+	const file = path.join(libDir, base);
+	let src = fs.readFileSync(file, "utf8");
+	if (!src.includes(PERFILE_TO)) {
+		const m = PERFILE_FROM_RE.exec(src);
+		if (!m) {
+			console.error(`${base}: per-file diagnostic wrapper anchor not found!`);
+			process.exit(1);
+		}
+		src = src.replace(PERFILE_FROM_RE, perFileResetBlock());
+		fs.writeFileSync(file, src);
+		console.log(`${base}: per-file diag cache reset hook applied`);
+	}
+}
+for (const base of ["_tsc.js"]) {
+	const file = path.join(libDir, base);
+	let src = fs.readFileSync(file, "utf8");
+	src = src.replace(/\/\/ ── TNB-WORKERPASS[\s\S]*?── end TNB-WORKERPASS ──\r?\n?/, "executeCommandLine(sys, noop, sys.args);\n");
+	if (!src.includes(WORKER_BOTTOM)) {
+		console.error(`${base}: worker bottom anchor not found!`);
+		process.exit(1);
+	}
+	src = src.replace(
+		WORKER_BOTTOM,
+		`// ── ${WORKER_MARKER}: resident session worker entry (bin/worker.js) ──\n` +
+		'  if (process.env.VUE_TSC_GO_WORKER_ROLE === "1") {\n' +
+		"    globalThis.__vueTscGoWorkerApi = { sys, executeCommandLine };\n" +
+		"  } else {\n" +
+		"    executeCommandLine(sys, noop, sys.args);\n" +
+		"  }\n" +
+		"  // ── end TNB-WORKERPASS ──",
+	);
+	fs.writeFileSync(file, src);
+	console.log(`${base}: worker patch applied`);
+}
 
 for (const base of ["typescript.js", "_tsc.js"]) {
 	const file = path.join(libDir, base);

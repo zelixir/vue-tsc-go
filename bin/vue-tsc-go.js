@@ -40,9 +40,10 @@ const bridgeDir = path.dirname(require.resolve("typescript-native-bridge/package
 const cacheMod = require("./cache.js");
 
 const rawArgv = process.argv.slice(2);
-const { argv, cacheDir: cacheDirArg, clear } = cacheMod.extractCacheArgs(rawArgv);
+const { argv, cacheDir: cacheDirArg, clear, noWorker } = cacheMod.extractCacheArgs(rawArgv);
 const isChild = !!process.env.VUE_TSC_GO_INTERNAL_CHILD;
 const cacheDisabled = isChild || cacheMod.isCacheDisableRequested(rawArgv, process.env);
+const workerMod = require("./worker-client.js");
 
 // --- cold-run peak-memory tuning (checker process only) ---
 //
@@ -180,12 +181,15 @@ function emitAndExit(stdoutBuf, stderrBuf, code) {
 	if (pending === 0) process.exit(code);
 }
 
-function main() {
+async function main() {
 	// cache management only applies to the top-level invocation
 	if (!isChild && clear) {
 		const tsconfigPath = cacheMod.resolveCacheDir(cacheDirArg, path.join(process.cwd(), "tsconfig.json"));
-		const ok = cacheMod.clearCache(tsconfigPath);
-		process.exit(ok ? 0 : 1);
+		workerMod.shutdownWorkers(tsconfigPath).catch(() => {}).then(() => {
+			const ok = cacheMod.clearCache(tsconfigPath);
+			process.exit(ok ? 0 : 1);
+		});
+		return;
 	}
 
 	if (cacheDisabled) {
@@ -200,6 +204,12 @@ function main() {
 	}
 
 	// --- cache-enabled parent path ---
+	// start the session worker (if enabled) before fingerprinting so its boot
+	// overlaps the plan computation on cold starts; no-op when disabled/running
+	const workerEnabledHere = !noWorker && workerMod.workerAllowed({ env: process.env, isTTY: process.stdout.isTTY });
+	if (workerEnabledHere) {
+		try { workerMod.preSpawnWorker({ argv, cacheDir: cacheDirArg, env: process.env, cwd: process.cwd() }); } catch {}
+	}
 	let plan;
 	let cacheDir;
 	try {
@@ -218,6 +228,23 @@ function main() {
 	}
 
 	if (plan && !plan.skip && cacheDir) {
+		// session worker path (see bin/worker.js): a resident process keeps the
+		// checker pipeline + Go engine session loaded across runs, so a small
+		// edit -> re-check loop avoids the child boot and the Go program
+		// rebuild entirely. Output guarantees are identical to the cache paths;
+		// ANY worker problem degrades to the regular flow below.
+		if (workerEnabledHere) {
+			try {
+				const wr = await workerMod.runViaWorker({ argv, cacheDir, plan, env: process.env });
+				if (wr) {
+					if (process.env.VUE_TSC_GO_DEBUG) process.stderr.write(`[vue-tsc-go debug] t=${Date.now()} worker mode=${wr.mode} ms=${wr.ms}\n`);
+					return emitAndExit(Buffer.from(wr.stdout, "utf8"), Buffer.from(wr.stderr, "utf8"), wr.exitCode);
+				}
+				if (process.env.VUE_TSC_GO_DEBUG) process.stderr.write(`[vue-tsc-go debug] t=${Date.now()} worker unavailable -> regular path\n`);
+			} catch (e) {
+				if (process.env.VUE_TSC_GO_DEBUG) process.stderr.write(`[vue-tsc-go debug] worker attempt threw: ${String((e && e.stack) || e)}\n`);
+			}
+		}
 		// hit? (key match + stat-verify of the recorded full-program file manifest,
 		// tolerating mtime/size churn on root files whose content hash is unchanged)
 		const entry = cacheMod.readEntry(cacheDir, plan.key);
@@ -254,4 +281,8 @@ function main() {
 	runCheckInProcess(argv);
 }
 
-main();
+main().catch((e) => {
+	// last-resort: never lose the run to an internal async error
+	process.stderr.write(`vue-tsc-go: internal error: ${String((e && e.stack) || e)}\n`);
+	runCheckInProcess(argv);
+});

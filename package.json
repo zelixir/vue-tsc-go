@@ -18,10 +18,10 @@
 		"node": ">=20.19"
 	},
 	"scripts": {
-		"test": "node test/selftest.js && node test/cache.test.js && node test/mutation.test.js"
+		"test": "node test/selftest.js && node test/cache.test.js && node test/mutation.test.js && node test/mutation-worker.test.js && node test/robustness.test.js"
 	},
 	"dependencies": {
-		"typescript-native-bridge": "6.0.3-bridge.16.tsgo.7.0.2",
+		"typescript-native-bridge": "^6.0.3-bridge.16.tsgo.7.0.2",
 		"vue-tsc": "3.1.5"
 	}
 }

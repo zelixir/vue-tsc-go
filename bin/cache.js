@@ -57,15 +57,17 @@ function extractCacheArgs(argv) {
 	const rest = [];
 	let cacheDir;
 	let clear = false;
+	let noWorker = false;
 	for (let i = 0; i < argv.length; i++) {
 		const a = argv[i];
 		if (a === "--no-cache") continue;
 		if (a === "--clear-cache") { clear = true; continue; }
+		if (a === "--no-worker") { noWorker = true; continue; }
 		if (a === "--cache-dir") { cacheDir = argv[++i]; continue; }
 		if (a.startsWith("--cache-dir=")) { cacheDir = a.slice("--cache-dir=".length); continue; }
 		rest.push(a);
 	}
-	return { argv: rest, cacheDir, clear };
+	return { argv: rest, cacheDir, clear, noWorker };
 }
 
 function resolveProjectConfigPath(argv, cwd) {
@@ -367,9 +369,10 @@ function writeEntry(cacheDir, key, payload) {
 		programFiles: payload.programFiles || null,
 		// v2 incremental metadata (see cache-incremental.js)
 		files: payload.files || null,
-		graph: payload.graph || null,
-		fileDiags: payload.fileDiags || null,
-		flags: payload.flags || null,
+			graph: payload.graph || null,
+			fileDiags: payload.fileDiags || null,
+			syntacticDiags: payload.syntacticDiags || null,
+			flags: payload.flags || null,
 		fileHashes: payload.fileHashes || null,
 	};
 	const dir = path.join(cacheDir, "entries");
@@ -488,6 +491,7 @@ module.exports = {
 	extractCacheArgs,
 	buildPlan,
 	resolveCacheDir,
+	resolveProjectConfigPath,
 	readEntry,
 	writeEntry,
 	verifyProgramFiles,

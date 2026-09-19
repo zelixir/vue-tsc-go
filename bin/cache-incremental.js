@@ -146,13 +146,14 @@ function buildReverseGraph(graph) {
  * Decide whether an incremental run is possible and prepare its manifest.
  * Returns { manifestPath, manifest, cleanup } or null (fall back to full run).
  */
-function prepareIncremental({ cacheDir, plan, oldEntry, tmpBase }) {
+function prepareIncremental({ cacheDir, plan, oldEntry, tmpBase, debug }) {
 	// entry-level gates: only metadata completeness (content-level risks are
 	// checked per changed/deleted file below and via post-run lost-file analysis)
-	if (!oldEntry || oldEntry.format !== 2) return null;
-	if (!oldEntry.graph || !oldEntry.fileDiags || !oldEntry.flags || !Array.isArray(oldEntry.files)) return null;
+	const fail = (why) => { if (debug) debug("prepareIncremental: " + why); return null; };
+	if (!oldEntry || oldEntry.format !== 2) return fail("no/old-format entry");
+	if (!oldEntry.graph || !oldEntry.fileDiags || !oldEntry.flags || !Array.isArray(oldEntry.files)) return fail("incomplete v2 metadata");
 	const flags = oldEntry.flags;
-	if (flags.filelessDiags) return null;
+	if (flags.filelessDiags) return fail("fileless diags");
 
 	// diff the root file sets (content hashes)
 	const oldMap = new Map(oldEntry.files.map(([f, h]) => [canon(f), h]));
@@ -160,13 +161,13 @@ function prepareIncremental({ cacheDir, plan, oldEntry, tmpBase }) {
 	const changed = [];
 	const deleted = [];
 	for (const [f, h] of newMap) {
-		if (!oldMap.has(f)) return null; // added file: could shadow module resolution -> full run
+		if (!oldMap.has(f)) return fail("added file: " + f);
 		if (oldMap.get(f) !== h) changed.push(f);
 	}
 	for (const f of oldMap.keys()) {
 		if (!newMap.has(f)) deleted.push(f);
 	}
-	if (!changed.length && !deleted.length) return null; // nothing actually changed (mtime-only churn is caught earlier)
+	if (!changed.length && !deleted.length) return fail("no content change");
 
 	// stat-verify the old program manifest: non-root program files (node_modules,
 	// workspace packages, generated files) must be content-identical — their
@@ -177,14 +178,14 @@ function prepareIncremental({ cacheDir, plan, oldEntry, tmpBase }) {
 		for (const [file, size, mtimeMs] of oldEntry.programFiles) {
 			let st;
 			try { st = fs.statSync(file); } catch {
-				if (!oldMap.has(canon(file))) return null; // non-root file disappeared
+				if (!oldMap.has(canon(file))) return fail("non-root file disappeared: " + file);
 				continue; // root file gone -> part of the diff
 			}
 			if (st.size === size && Math.round(st.mtimeMs) === mtimeMs) continue;
 			if (oldMap.has(canon(file))) continue; // root file -> part of the diff
 			let content;
-			try { content = fs.readFileSync(file); } catch { return null; }
-			if (!oldEntry.fileHashes || oldEntry.fileHashes[canon(file)] !== sha1(content)) return null;
+			try { content = fs.readFileSync(file); } catch { return fail("unreadable program file: " + file); }
+			if (!oldEntry.fileHashes || oldEntry.fileHashes[canon(file)] !== sha1(content)) return fail("program file content changed: " + file);
 		}
 	}
 
@@ -195,13 +196,13 @@ function prepareIncremental({ cacheDir, plan, oldEntry, tmpBase }) {
 	//  - new content of changed files must neither be a global script with
 	//    declarations nor add a module augmentation / declare global
 	for (const f of changed) {
-		if (flags.globalScripts.includes(f) || flags.augmentationRisk.includes(f)) return null;
+		if (flags.globalScripts.includes(f) || flags.augmentationRisk.includes(f)) return fail("changed file has global-scope role: " + f);
 		const realPath = plan.files.find(([p]) => canon(p) === f);
 		const c = classifyRootFile(realPath ? realPath[0] : f);
-		if ((!c.moduleLike && !c.emptyish) || c.augmentationRisk) return null;
+		if ((!c.moduleLike && !c.emptyish) || c.augmentationRisk) return fail("changed file not module-like: " + f);
 	}
 	for (const f of deleted) {
-		if (flags.globalScripts.includes(f) || flags.augmentationRisk.includes(f)) return null;
+		if (flags.globalScripts.includes(f) || flags.augmentationRisk.includes(f)) return fail("deleted file has global-scope role: " + f);
 	}
 
 	// reverse transitive dependent closure of the changed/deleted set
@@ -219,10 +220,10 @@ function prepareIncremental({ cacheDir, plan, oldEntry, tmpBase }) {
 	}
 	// only files that still exist can be re-checked; deleted files just lose their diags
 	const affectedList = [...affected].filter((f) => newMap.has(f));
-	if (!affectedList.length) return null;
+	if (!affectedList.length) return fail("empty affected set");
 	const maxAffected = Math.max(48, Math.ceil(newMap.size * AFFECTED_RATIO_MAX));
 	if (affectedList.length > AFFECTED_ABS_MAX || affectedList.length >= newMap.size || affectedList.length > maxAffected) {
-		return null; // not worth it / would save nothing
+		return fail("affected set too large: " + affectedList.length);
 	}
 
 	// manifest: cached diagnostics for every unaffected program file
@@ -232,20 +233,35 @@ function prepareIncremental({ cacheDir, plan, oldEntry, tmpBase }) {
 		if (!newMap.has(f) && !oldEntry.graph[f]) continue; // file left the program entirely
 		cached[f] = diags;
 	}
+	// optional per-file syntactic diagnostics (available when the entry was
+	// produced by a session worker that dumped them) — lets the incremental run
+	// replay the whole-program syntactic pass as well
+	const cachedSyntactic = {};
+	if (oldEntry.syntacticDiags) {
+		for (const [f, diags] of Object.entries(oldEntry.syntacticDiags)) {
+			if (affected.has(f)) continue;
+			if (!newMap.has(f) && !oldEntry.graph[f]) continue;
+			cachedSyntactic[f] = diags;
+		}
+	}
 
 	const manifestPath = tmpBase + ".incr-manifest.json";
 	const freshDump = tmpBase + ".incr-fresh.json";
+	const freshSyntacticDump = tmpBase + ".incr-synfresh.json";
 	fs.writeFileSync(manifestPath, JSON.stringify({
 		affected: affectedList.sort(),
 		cached,
 		freshDump,
+		...(oldEntry.syntacticDiags ? { cachedSyntactic, freshSyntacticDump } : {}),
 	}));
 	return {
 		manifestPath,
 		freshDump,
+		freshSyntacticDump: oldEntry.syntacticDiags ? freshSyntacticDump : null,
 		affectedList,
 		deleted,
 		cachedManifest: cached,
+		cachedSyntactic: oldEntry.syntacticDiags ? cachedSyntactic : null,
 	};
 }
 
@@ -436,6 +452,7 @@ module.exports = {
 	tryIncremental,
 	computeRootFlags,
 	prepareIncremental,
+	mergeFileDiags,
 	programGainedUnknownFiles,
 	programLostRiskyFiles,
 	canon,

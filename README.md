@@ -88,7 +88,44 @@ bin/vue-tsc-go.js
 - program 文件清单走 size+mtime 校验而非内容哈希:同内容但 mtime 变化的文件(如 `git checkout`、重装依赖)会造成一次多余的失效重跑(方向安全);**新增**文件如果未被任何已跟踪文件引用,不会被察觉(但不被引用的文件不影响诊断)。
 - 诊断输出中的相对路径按运行时 cwd 解析,同一项目从不同 cwd 运行会得到不同 key(安全但缓存不共享)。
 
-## 冷跑内存调优
+### 会话级按需 worker（增量 typecheck 再提速）
+
+在"编辑几个文件 → 再跑一次 typecheck"的本地循环里,连缓存命中路径的冷启动地板（进程启动 + 全量指纹哈希 ≈ 0.3s）与增量路径的子进程冷启动（Node + bundle 加载 ≈ 0.9s）都可以省掉。为此 vue-tsc-go 提供**按需拉起、空闲自退的常驻会话 worker**（`bin/worker.js`）:
+
+```
+CLI 进程（每次运行都是新进程）                 会话 worker（bin/worker.js，按需常驻）
+─────────────────────────────                ─────────────────────────────────────
+1. 指纹: tsconfig 链 + argv + env + 全部      常驻持有:
+   根文件内容哈希（~0.26s @ element-plus）      - Module hook + vue-tsc + tsc bundle（Volar 管线）
+2. 解析 worker 命名管道,连接（不在则             - 进程内 Go 引擎会话（project/overlay 缓存跨运行复用）
+   后台拉起一个,与指纹计算并行）                - 上次运行的会话状态（program 文件清单/解析图/逐文件诊断）
+3. 发送 {argv, plan} 请求,按序取回
+   {stdout, stderr, exitCode} 原样输出
+```
+
+worker 内的三种路径,输出与全量跑逐字节一致（与磁盘缓存同一套保守失效规则,任何疑问回退全量）:
+
+- **replay**:plan key 与会话上次运行相同（内容零变化,且 program 文件清单 stat 校验通过）→ 直接回放内存中的结果（毫秒级）。
+- **incremental**:内容有变化 → 对变更文件调用 bridge 的外部变更通知（与 `tsc --watch` 同一机制,Go 引擎从磁盘重读快照）→ 只重新检查变更文件的反向依赖闭包（沿用 `prepareIncremental` 的保守规则:新增/删除文件、全局脚本/模块增强改动、受影响面超 40% 等回退全量）,其余文件诊断从会话内存重放;语义与语法诊断均逐文件混合。
+- **full**:以上任一前提不成立 → 会话内全量重跑（仍省掉子进程启动,Go 会话增量复用）。
+
+每次 worker 运行（含 replay 之外的增量/全量）都会回写 v2 磁盘缓存条目,worker 死后磁盘命中/磁盘增量路径照常可用,只是变慢、不会出错。
+
+**开关与默认行为**:
+
+| 开关 | 说明 |
+|---|---|
+| （默认） | 仅在 stdout 为 TTY 的交互终端启用（CI / npm scripts 等非 TTY 环境自动不用 worker） |
+| `VUE_TSC_GO_WORKER=1` | 强制启用（非 TTY 环境如需使用设置此项） |
+| `--no-worker` / `VUE_TSC_GO_NO_WORKER=1` | 禁用,行为与升级前完全一致 |
+| `VUE_TSC_GO_WORKER_IDLE_MS` | 空闲自退时间,默认 600000（10 分钟） |
+| `--clear-cache` | 同时结束该项目注册的所有 worker |
+
+worker 是**按需 worker,不是 watch 常驻**:不做文件系统监听、不做任何主动工作,只在 CLI 运行到来时处理一次检查;空闲超时自退,kill 掉后下一次运行自动拉起并回退到常规路径（只损失速度）。单 worker 单会话,会话按 (工具链 + tsconfig + argv + cwd) 维度绑定,任一变化即重启会话——常驻内存上界 = 一份 Go program（约 1~1.5GB,element-plus 实测约 2.0GB 工作集含 V8）。多个 tsconfig（如 vben 的 app/worker 配置)会各自有独立 worker,请注意内存余量。
+
+与磁盘缓存一样,`--no-cache`、`--watch` 等非诊断模式不经过 worker;两个 CLI 并发运行同一项目时,worker 内部按序串行处理,输出互不串扰。
+
+
 
 缓存 miss(冷跑)时,checker 进程内同时驻留 Go 运行时(tsgo 引擎,峰值大头)与 V8 堆(vue-tsc + Volar 虚拟代码)。CLI 在拉起 checker 时自动施加两组**仅影响 GC 行为、不影响诊断输出**的参数(`bin/vue-tsc-go.js`):
 
