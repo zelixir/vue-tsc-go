@@ -46,6 +46,28 @@ const packageDir = path.join(__dirname, "..");
 const bridgeDir = path.dirname(require.resolve("typescript-native-bridge/package.json"));
 const cacheMod = require("./cache.js");
 
+// --- self-heal: make sure the bridge bundles carry the diagnostic alignment
+// layer (TNB-PATCH/TNB-SUBPROG markers). Needed right after a fresh `npm i`
+// (installed bridge is pristine), after a bridge upgrade, or when a package
+// manager restored node_modules. The patcher is idempotent, so this only does
+// real work when the markers are missing; ~20ms when already applied.
+(function ensureBridgePatched() {
+	const needsPatch = ["lib/typescript.js", "lib/_tsc.js"].some((rel) => {
+		try {
+			const src = fs.readFileSync(path.join(bridgeDir, rel), "utf8");
+			return !src.includes("TNB-PATCH:") || !src.includes("TNB-SUBPROG");
+		} catch {
+			return true;
+		}
+	});
+	if (!needsPatch) return;
+	const patcher = path.join(__dirname, "..", "scripts", "patch-tnb-directives.js");
+	const res = spawnSync(process.execPath, [patcher, bridgeDir], { stdio: ["ignore", "pipe", "inherit"], encoding: "utf8" });
+	if (res.status !== 0) {
+		console.error("vue-tsc-go: failed to patch typescript-native-bridge (diagnostics may differ from stock vue-tsc).");
+	}
+})();
+
 const rawArgv = process.argv.slice(2);
 const { argv, cacheDir: cacheDirArg, clear, worker: workerFlag } = cacheMod.extractCacheArgs(rawArgv);
 const cacheDisabled = cacheMod.isCacheDisableRequested(rawArgv, process.env);

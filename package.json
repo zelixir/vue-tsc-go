@@ -12,7 +12,8 @@
 	},
 	"main": "./bin/vue-tsc-go.js",
 	"files": [
-		"bin"
+		"bin",
+		"scripts"
 	],
 	"engines": {
 		"node": ">=20.19"

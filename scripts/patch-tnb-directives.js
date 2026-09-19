@@ -34,7 +34,20 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
-const libDir = path.join(__dirname, "..", "node_modules", "typescript-native-bridge", "lib");
+// Bridge lib dir: optional first argv (used by bin/vue-tsc-go.js self-heal so
+// this works from any install layout), else resolved relative to this script
+// (covers a repo checkout and an npm/pnpm-installed dependency alike).
+let libDir;
+if (process.argv[2]) {
+	libDir = path.join(process.argv[2], "lib");
+} else {
+	try {
+		const pkg = require.resolve("typescript-native-bridge/package.json", { paths: [__dirname, path.join(__dirname, "..")] });
+		libDir = path.join(path.dirname(pkg), "lib");
+	} catch {
+		libDir = path.join(__dirname, "..", "node_modules", "typescript-native-bridge", "lib");
+	}
+}
 
 const HELPERS = `
   // ── TNB-PATCH: JS-side comment-directive alignment (added by patch script) ──
